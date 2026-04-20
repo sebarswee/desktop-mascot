@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebSearch",
-      "Bash(npm create *)",
-      "Bash(npm run *)"
-    ]
-  }
-}
