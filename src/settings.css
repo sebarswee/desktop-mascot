@@ -71,6 +71,22 @@ html, body {
   font-size: 12px;
 }
 
+.settings-section input[type="password"],
+.settings-section input[type="text"] {
+  flex: 1;
+  padding: 4px 8px;
+  border: 1px solid #444;
+  border-radius: 5px;
+  background: #2a2a2a;
+  color: #eee;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.hidden-row {
+  display: none !important;
+}
+
 .checkbox-label {
   justify-content: flex-start !important;
   gap: 10px;
@@ -130,4 +146,12 @@ html, body {
 
 .save-status.visible {
   opacity: 1;
+}
+
+/* Shortcut key recording */
+input[data-recording="true"] {
+  border-color: #ff9a9e !important;
+  background: #2d1f1f !important;
+  color: #ff9a9e !important;
+  text-align: center;
 }

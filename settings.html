@@ -47,6 +47,39 @@
         </label>
       </div>
 
+      <div class="settings-section">
+        <h4>AI 模型</h4>
+        <label>提供商
+          <select id="llm-provider">
+            <option value="claude">Claude (Anthropic)</option>
+            <option value="openai">OpenAI</option>
+            <option value="openai_compatible">OpenAI Compatible</option>
+            <option value="gemini">Gemini (Google)</option>
+            <option value="ollama">Ollama (本地)</option>
+          </select>
+        </label>
+        <label>API Key
+          <input id="llm-api-key" type="password" placeholder="输入 API Key" />
+        </label>
+        <label>模型
+          <input id="llm-model" type="text" placeholder="例如 claude-3-5-sonnet-20241022" />
+        </label>
+        <label id="base-url-row" class="hidden-row">Base URL
+          <input id="llm-base-url" type="text" placeholder="http://localhost:8080/v1" />
+        </label>
+      </div>
+
+      <div class="settings-section">
+        <h4>对话框</h4>
+        <label class="checkbox-label">
+          <input id="auto-close-chat" type="checkbox" />
+          点击桌面其他位置自动关闭
+        </label>
+        <label>唤醒快捷键
+          <input id="chat-shortcut" type="text" placeholder="点击后按下快捷键" readonly />
+        </label>
+      </div>
+
       <div class="settings-actions">
         <button id="save-btn" class="btn-primary">保存</button>
         <button id="reset-btn" class="btn-secondary">恢复默认</button>

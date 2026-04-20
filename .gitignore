@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.claude
+
+# Local runtime config (contains API keys)
+behavior.json
+llm_config.json

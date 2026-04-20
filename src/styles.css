@@ -77,27 +77,3 @@ html, body {
   100% { transform: rotate(360deg); }
 }
 
-.settings-btn {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  width: 28px;
-  height: 28px;
-  border: none;
-  border-radius: 50%;
-  background: rgba(0,0,0,0.3);
-  color: #fff;
-  font-size: 16px;
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.2s;
-  z-index: 10;
-}
-
-body:hover .settings-btn {
-  opacity: 1;
-}
-
-.settings-btn:hover {
-  background: rgba(0,0,0,0.5);
-}

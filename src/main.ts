@@ -4,7 +4,6 @@ import lottie from 'lottie-web';
 import animationData from './cat.json';
 
 const mascot = document.getElementById('mascot')!;
-const settingsBtn = document.getElementById('settings-btn')!;
 
 const anim = lottie.loadAnimation({
   container: document.getElementById('lottie')!,
@@ -42,6 +41,16 @@ listen<{ state: string; peek_edge?: string; interact_type?: string }>('mascot:st
   }
 });
 
-settingsBtn.addEventListener('click', () => {
-  invoke('open_settings_window').catch(console.error);
+function openChat() {
+  invoke('open_chat_window').catch(console.error);
+}
+
+mascot.addEventListener('click', () => {
+  openChat();
+});
+
+// Lottie SVG may swallow events — bind directly on the container too
+document.getElementById('lottie')?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  openChat();
 });

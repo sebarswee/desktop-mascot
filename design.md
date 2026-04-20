@@ -17,8 +17,9 @@
 ├─────────────────────────────────────────────────────────────┤
 │  控制层（Tauri Core / Rust）                                 │
 │  · 窗口管理（位置、尺寸、层级、透明、穿透）                  │
-│  · 行为状态机调度器（100ms tick，6 状态）                    │
-│  · 系统集成（Dock 显隐、菜单栏 Tray、配置持久化）            │
+│  · 行为状态机调度器（100ms tick，7 状态）                    │
+│  · 系统集成（Dock 显隐、菜单栏 Tray、全局快捷键、配置持久化）│
+│  · LLM API 代理（reqwest，5 提供商）                         │
 ├─────────────────────────────────────────────────────────────┤
   ↑ ↓ 异步调用
 ├─────────────────────────────────────────────────────────────┤
@@ -49,6 +50,7 @@
 - [x] `window.set_background_color(Color(0,0,0,0))` + `shadow: false` 消除透明黑边
 - [x] `Monitor::all()` 获取屏幕可用工作区，作为角色活动边界
 - [x] `window.set_position(PhysicalPosition { x, y })` 实时更新窗口坐标
+- [x] `tauri-plugin-global-shortcut` 全局快捷键注册/动态重载
 - [ ] `window.set_ignore_cursor_events(true)` 实现非角色区域鼠标穿透（待优化）
 
 ---
@@ -69,13 +71,13 @@
 
 ```
 角色主体 (200x200 透明窗口)
-├── idle      → 待机循环（Lottie 速度 0.5x，柔和呼吸感）
-├── walk      → 移动循环（Lottie 速度 2.0x，表现走动）
+├── idle      → 待机循环（Lottie 速度 1.0x）
+├── walk      → 移动循环（Lottie 速度 1.5x）
 ├── peek      → 探头（从屏幕边缘探入/缩回）
-├── disappear → 消失（CSS opacity + scale 动画）
+├── disappear → 消失（Lottie 速度 0.5x，CSS opacity + scale）
 ├── reappear  → 出现（CSS opacity + scale 动画）
-├── interact  → 交互动作（招手、跳跃、转圈）
-└── talk      → 说话动画（配合 TTS，Sprint 3）
+├── interact  → 交互动作（招手/跳跃/转圈，Lottie 速度 2.0x）
+└── chat      → 对话冻结（Lottie 速度 1.0x，窗口位置冻结）
 ```
 
 前端通过监听 `mascot:state` 事件切换 CSS class，同步调整 Lottie 播放速度。
@@ -94,10 +96,9 @@ enum MascotState {
     Disappear,  // 消失：淡出为 0，期间窗口隐藏
     Reappear,   // 出现：从随机位置淡入
     Interact,   // 交互：播放一次性花哨动作
+    Chat,       // 对话：冻结自动行为，等待用户关闭对话框
 }
 ```
-
-> `Sleep`、`Talking` 状态计划在 Sprint 3 引入。
 
 ### 4.2 状态转移规则（带权重随机）
 
@@ -154,11 +155,12 @@ INTERACT   ──(100%)──→ IDLE  （2-4s 动作完成后）
 
 | 模块 | 职责 | 对应代码区域 |
 | :--- | :--- | :--- |
-| `config` | `BehaviorConfig` 定义、JSON 持久化 | `lib.rs:35-102` |
-| `dock_control` | macOS Dock 显隐（objc 调用） | `lib.rs:104-121` |
-| `tray` | 菜单栏图标 + 右键菜单 | `lib.rs:123-206` |
-| `state_machine` | 状态定义、转移、tick 循环 | `lib.rs:289-522` |
-| `commands` | Tauri 暴露的前端调用接口 | `lib.rs:524-558` |
+| `config` | `BehaviorConfig` / `LlmConfig` 定义、JSON 持久化 | `lib.rs:35-140` |
+| `dock_control` | macOS Dock 显隐（objc 调用） | `lib.rs:142-220` |
+| `tray` | 菜单栏图标 + 右键菜单 | `lib.rs:280-310` |
+| `state_machine` | 状态定义、转移、tick 循环 | `lib.rs:380-700` |
+| `llm_proxy` | 5 提供商 LLM 调用（reqwest） | `lib.rs:710-960` |
+| `commands` | Tauri 暴露的前端调用接口 | `lib.rs:960-1115` |
 
 ---
 
@@ -175,7 +177,15 @@ INTERACT   ──(100%)──→ IDLE  （2-4s 动作完成后）
   "interact_weight": 2,
   "show_in_dock": false,
   "show_in_menu_bar": true,
-  "fixed_corner": null
+  "fixed_corner": null,
+  "auto_close_chat": true,
+  "chat_shortcut": "Ctrl+Alt+C",
+  "llm": {
+    "provider": "claude",
+    "api_key": "",
+    "model": "claude-3-5-sonnet-20241022",
+    "base_url": null
+  }
 }
 ```
 
@@ -250,12 +260,21 @@ Rust 根据用户选择的模型配置调用对应 API
 - [x] macOS Dock 显隐控制（objc）
 - [x] 菜单栏 Tray 图标 + 右键菜单
 
-### Sprint 3：AI 对话入口 🔄
+### Sprint 3：AI 对话入口 ✅
 
-- [ ] 对话气泡 UI
-- [ ] Rust LLM Proxy（支持多模型切换）
-- [ ] 点击角色触发对话
-- [ ] TTS 基础版（Web Speech API）
+- [x] 独立对话窗口（500x600，居中显示，无边框透明）
+- [x] 暗色主题气泡 UI（用户粉色 / AI 深灰 / 错误红色）
+- [x] Rust LLM Proxy（reqwest，5 提供商：Claude / OpenAI / OpenAI-Compatible / Gemini / Ollama）
+- [x] 点击角色触发对话，对话期间宠物冻结（`Chat` 状态）
+- [x] 关闭对话后自动恢复 `Idle`
+- [x] 设置面板：LLM 提供商 / API Key / 模型 / Base URL
+- [x] 点击外部自动关闭（`auto_close_chat`，可开关）
+- [x] 全局快捷键唤醒（`tauri-plugin-global-shortcut`，macOS 默认 `Cmd+Shift+C`，Win/Linux 默认 `Ctrl+Alt+C`）
+- [x] 设置面板快捷键**按键录制**（focus → 监听 keydown → 自动格式化）
+- [x] 修复无响应：消除 `Mutex` 锁竞争，命令函数无锁化，状态由 `tick()` 根据窗口可见性自动同步
+- [x] 移除主窗口右上角设置按钮，减少遮挡（设置入口保留在 Tray 右键菜单）
+- [x] Claude 第三方代理支持（配置 Base URL，自动降级为 OpenAI-compatible 格式调用）
+- [x] 编译器 warning 清零（`#[allow(unexpected_cfgs)]` + 未使用变量前缀 `_`）
 
 ### Sprint 4： polish + 跨平台 🔄
 
@@ -279,12 +298,15 @@ desktop-mascot/
 │   ├── Cargo.toml
 │   └── tauri.conf.json         # 窗口配置（200x200, transparent, alwaysOnTop）
 ├── src/
-│   ├── main.ts                 # 主窗口：Lottie 渲染 + 状态监听 + 设置按钮
+│   ├── main.ts                 # 主窗口：Lottie 渲染 + 状态监听 + 点击打开对话
+│   ├── chat.ts                 # 对话窗口：消息收发、加载态、自动关闭配置
+│   ├── chat.css                # 对话面板暗色气泡样式
 │   ├── settings.ts             # 设置窗口：表单批量保存/恢复默认
 │   ├── settings.css            # 设置面板暗色主题样式
 │   ├── styles.css              # 主窗口样式（mascot 定位 + 状态动画）
 │   └── cat.json                # Lottie 动画数据
 ├── index.html                  # 主窗口入口
+├── chat.html                   # 对话窗口入口
 ├── settings.html               # 设置窗口入口
 ├── vite.config.ts              # Vite 多页面 Rollup 配置
 ├── package.json
@@ -301,3 +323,6 @@ desktop-mascot/
 3. **设置窗口独立化**：设置面板不再作为 overlay 嵌入主窗口，而是通过 `WebviewWindowBuilder` 创建独立窗口（280x420），避免随宠物移动
 4. **配置热更新**：`set_config` 命令直接更新运行中状态机的 `config` 字段，无需重启应用
 5. **macOS 私有 API**：启用 `macos-private-api` 实现真透明窗口，这是 Tauri 2.0 在 macOS 上实现无黑边透明的必要手段
+6. **全局快捷键跨平台差异**：macOS 默认 `Cmd+Shift+C`，Windows/Linux 默认 `Ctrl+Alt+C`，通过 `#[cfg(target_os = "macos")]` 在编译期确定默认值
+7. **无响应根因与修复**：`std::sync::Mutex` 锁竞争导致 UI 线程阻塞。根本解法是命令函数彻底不拿锁，仅做窗口操作；状态同步完全委托给 `tick()` 循环根据窗口可见性自动推断
+8. **快捷键录制 UX**：设置面板中快捷键输入框采用 `focus → keydown 监听 → 自动格式化` 的交互模式，支持 `Escape` 取消、`Backspace` 清空，避免用户手动输入格式错误

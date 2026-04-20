@@ -1,8 +1,11 @@
+#![allow(unexpected_cfgs)]
+
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, PhysicalPosition, State};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 // ── State definitions ──────────────────────────────────────────────
 
@@ -15,6 +18,7 @@ enum MascotState {
     Disappear,
     Reappear,
     Interact,
+    Chat,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +38,54 @@ enum InteractType {
 
 // ── Config ─────────────────────────────────────────────────────────
 
+// ── LLM Config ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LlmProvider {
+    Claude,
+    Openai,
+    #[serde(rename = "openai_compatible")]
+    OpenaiCompatible,
+    Gemini,
+    Ollama,
+}
+
+impl Default for LlmProvider {
+    fn default() -> Self {
+        LlmProvider::Claude
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LlmConfig {
+    #[serde(default)]
+    provider: LlmProvider,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default = "default_model")]
+    model: String,
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+fn default_model() -> String {
+    "claude-3-5-sonnet-20241022".to_string()
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: LlmProvider::Claude,
+            api_key: String::new(),
+            model: default_model(),
+            base_url: None,
+        }
+    }
+}
+
+// ── Behavior Config ────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BehaviorConfig {
     idle_weight: u32,
@@ -47,10 +99,26 @@ struct BehaviorConfig {
     show_in_menu_bar: bool,
     #[serde(default)]
     fixed_corner: Option<String>,
+    #[serde(default)]
+    llm: LlmConfig,
+    #[serde(default = "default_true")]
+    auto_close_chat: bool,
+    #[serde(default = "default_chat_shortcut")]
+    chat_shortcut: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(target_os = "macos")]
+fn default_chat_shortcut() -> String {
+    "Cmd+Shift+C".to_string()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_chat_shortcut() -> String {
+    "Ctrl+Alt+C".to_string()
 }
 
 impl Default for BehaviorConfig {
@@ -64,6 +132,9 @@ impl Default for BehaviorConfig {
             show_in_dock: false,
             show_in_menu_bar: true,
             fixed_corner: None,
+            llm: LlmConfig::default(),
+            auto_close_chat: true,
+            chat_shortcut: default_chat_shortcut(),
         }
     }
 }
@@ -101,7 +172,17 @@ fn save_config(config: &BehaviorConfig) -> Result<(), String> {
     Ok(())
 }
 
-// ── macOS Dock control ─────────────────────────────────────────────
+fn load_or_create_llm_config() -> LlmConfig {
+    load_or_create_config().llm
+}
+
+fn save_llm_config(config: &LlmConfig) -> Result<(), String> {
+    let mut behavior = load_or_create_config();
+    behavior.llm = config.clone();
+    save_config(&behavior)
+}
+
+// ── macOS Window helpers ───────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
 fn set_dock_visibility(show: bool) {
@@ -119,6 +200,22 @@ fn set_dock_visibility(show: bool) {
 
 #[cfg(not(target_os = "macos"))]
 fn set_dock_visibility(_show: bool) {}
+
+#[cfg(target_os = "macos")]
+fn set_window_all_spaces(window: &tauri::WebviewWindow) {
+    use objc::runtime::Object;
+    use objc::*;
+    use std::os::raw::c_ulong;
+
+    unsafe {
+        let ns_window = window.ns_window().expect("ns_window");
+        let behavior: c_ulong = 1; // NSWindowCollectionBehaviorCanJoinAllSpaces
+        let _: () = msg_send![ns_window as *mut Object, setCollectionBehavior: behavior];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_window_all_spaces(_window: &tauri::WebviewWindow) {}
 
 // ── Tray (Menu Bar) ────────────────────────────────────────────────
 
@@ -149,6 +246,42 @@ fn open_settings_window_impl(app: &tauri::AppHandle) -> Result<(), tauri::Error>
         .resizable(false)
         .center()
         .build()?;
+    }
+    Ok(())
+}
+
+fn open_chat_window_impl(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
+    if let Some(window) = app.get_webview_window("chat") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else {
+        let _window = tauri::WebviewWindowBuilder::new(
+            app,
+            "chat",
+            tauri::WebviewUrl::App("chat.html".into()),
+        )
+        .title("与宠物对话")
+        .inner_size(500.0, 600.0)
+        .center()
+        .resizable(false)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .build()?;
+
+        if let Some(window) = app.get_webview_window("chat") {
+            let _ = window.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
+        }
+    }
+
+    Ok(())
+}
+
+fn close_chat_window_impl(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
+    if let Some(window) = app.get_webview_window("chat") {
+        let _ = window.hide();
     }
     Ok(())
 }
@@ -232,16 +365,16 @@ fn emit_state(
 
 // ── Screen helpers ─────────────────────────────────────────────────
 
-fn get_primary_bounds(app: &tauri::AppHandle) -> (i32, i32, i32, i32) {
-    let monitor = app.primary_monitor().unwrap().unwrap();
+fn get_primary_bounds(app: &tauri::AppHandle) -> Option<(i32, i32, i32, i32)> {
+    let monitor = app.primary_monitor().ok()??;
     let size = monitor.size();
     let pos = monitor.position();
-    (
+    Some((
         pos.x,
         pos.y,
         pos.x + size.width as i32,
         pos.y + size.height as i32,
-    )
+    ))
 }
 
 fn is_near_edge(x: i32, y: i32, bounds: (i32, i32, i32, i32)) -> bool {
@@ -312,7 +445,7 @@ fn transition_to(
     new_state: MascotState,
     bounds: (i32, i32, i32, i32),
 ) {
-    let (_, _, max_x, max_y) = bounds;
+    let (_, _, _max_x, _max_y) = bounds;
     let window_size = 200;
     let margin = 80;
     let mut rng = rand::thread_rng();
@@ -379,15 +512,26 @@ fn transition_to(
             };
             sm.interact_timer = rng.gen_range(20..40); // 2–4 s
         }
+        MascotState::Chat => {
+            // No transition setup needed; Chat state is entered directly
+        }
     }
     sm.state = new_state;
 }
 
 fn pick_next_state(sm: &StateMachineInner) -> MascotState {
     let mut rng = rand::thread_rng();
+
+    // Fixed corner mode: never walk or peek; stay put with idle / interact / disappear
+    let (walk_w, peek_w) = if sm.config.fixed_corner.is_some() {
+        (0, 0)
+    } else {
+        (sm.config.walk_weight, sm.config.peek_weight)
+    };
+
     let total = sm.config.idle_weight
-        + sm.config.walk_weight
-        + sm.config.peek_weight
+        + walk_w
+        + peek_w
         + sm.config.disappear_weight
         + sm.config.interact_weight;
     let r = rng.gen_range(0..total);
@@ -395,9 +539,9 @@ fn pick_next_state(sm: &StateMachineInner) -> MascotState {
     let mut cum = 0;
     cum += sm.config.idle_weight;
     if r < cum { return MascotState::Idle; }
-    cum += sm.config.walk_weight;
+    cum += walk_w;
     if r < cum { return MascotState::Walk; }
-    cum += sm.config.peek_weight;
+    cum += peek_w;
     if r < cum { return MascotState::Peek; }
     cum += sm.config.disappear_weight;
     if r < cum { return MascotState::Disappear; }
@@ -405,14 +549,43 @@ fn pick_next_state(sm: &StateMachineInner) -> MascotState {
 }
 
 async fn tick(state_machine: StateMachine, app: tauri::AppHandle) {
-    let bounds = get_primary_bounds(&app);
-    let mut sm = state_machine.lock().unwrap();
-    let window = app.get_webview_window("main").unwrap();
-    let pos = window.outer_position().unwrap();
+    let Some(bounds) = get_primary_bounds(&app) else { return; };
+    let mut sm = state_machine.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(window) = app.get_webview_window("main") else { return; };
+    let pos = window.outer_position().unwrap_or(PhysicalPosition::new(0, 0));
+
+    // Auto-sync Chat/Idle state based on chat window visibility (commands no longer hold the lock)
+    let chat_visible = app.get_webview_window("chat")
+        .map(|w| w.is_visible().unwrap_or(false))
+        .unwrap_or(false);
+
+    if chat_visible && sm.state != MascotState::Chat {
+        sm.state = MascotState::Chat;
+        emit_state(&app, MascotState::Chat, None, None);
+    } else if !chat_visible && sm.state == MascotState::Chat {
+        transition_to(&mut sm, MascotState::Idle, bounds);
+        emit_state(&app, MascotState::Idle, None, None);
+    }
 
     match sm.state {
         MascotState::Idle => {
             sm.idle_ticks += 1;
+
+            // Fixed corner mode: gently pull back to anchor position
+            if let Some(ref corner) = sm.config.fixed_corner {
+                let anchor = pick_corner_position(corner, bounds, 200, 80);
+                let dx = anchor.0 - pos.x;
+                let dy = anchor.1 - pos.y;
+                let dist = ((dx as f64).powi(2) + (dy as f64).powi(2)).sqrt();
+                if dist > 5.0 {
+                    let step = (dist * 0.05).max(1.0).min(6.0);
+                    let ratio = step / dist;
+                    let new_x = pos.x + (dx as f64 * ratio) as i32;
+                    let new_y = pos.y + (dy as f64 * ratio) as i32;
+                    let _ = window.set_position(PhysicalPosition::new(new_x, new_y));
+                }
+            }
+
             if sm.idle_ticks > 30 {
                 let next = pick_next_state(&sm);
                 transition_to(&mut sm, next, bounds);
@@ -485,7 +658,6 @@ async fn tick(state_machine: StateMachine, app: tauri::AppHandle) {
             sm.disappear_timer = sm.disappear_timer.saturating_sub(1);
             if sm.disappear_timer == 0 {
                 // Move to new random position while invisible
-                let mut rng = rand::thread_rng();
                 let margin = 80;
                 let window_size = 200;
                 let (new_x, new_y) = if let Some(ref corner) = sm.config.fixed_corner {
@@ -518,7 +690,231 @@ async fn tick(state_machine: StateMachine, app: tauri::AppHandle) {
                 println!("[Mascot] Interact -> Idle");
             }
         }
+
+        MascotState::Chat => {
+            // Frozen while chatting
+            return;
+        }
     }
+}
+
+// ── LLM Proxy ──────────────────────────────────────────────────────
+
+use reqwest::Client;
+
+async fn send_chat_message(message: &str, config: &LlmConfig) -> Result<String, String> {
+    let client = Client::new();
+    match config.provider {
+        LlmProvider::Claude => call_claude(&client, message, config).await,
+        LlmProvider::Openai => call_openai(&client, message, config).await,
+        LlmProvider::OpenaiCompatible => call_openai_compatible(&client, message, config).await,
+        LlmProvider::Gemini => call_gemini(&client, message, config).await,
+        LlmProvider::Ollama => call_ollama(&client, message, config).await,
+    }
+}
+
+#[derive(Serialize)]
+struct ClaudeMsg {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct ClaudeReq {
+    model: String,
+    max_tokens: u32,
+    messages: Vec<ClaudeMsg>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeContent {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct ClaudeResp {
+    content: Vec<ClaudeContent>,
+}
+
+async fn call_claude(client: &Client, message: &str, config: &LlmConfig) -> Result<String, String> {
+    if config.api_key.is_empty() {
+        return Err("API Key 未设置".into());
+    }
+
+    // 第三方代理通常使用 OpenAI 兼容接口
+    if let Some(ref base) = config.base_url {
+        let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+        return call_openai_inner(client, message, config, &url).await;
+    }
+
+    let body = ClaudeReq {
+        model: config.model.clone(),
+        max_tokens: 1024,
+        messages: vec![ClaudeMsg {
+            role: "user".into(),
+            content: message.into(),
+        }],
+    };
+    let res = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &config.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("API 错误: {}", res.text().await.unwrap_or_default()));
+    }
+    let json: ClaudeResp = res.json().await.map_err(|e| e.to_string())?;
+    json.content.into_iter().next().map(|c| c.text).ok_or_else(|| "空响应".into())
+}
+
+#[derive(Serialize, Deserialize)]
+struct OpenAiMsg {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct OpenAiReq {
+    model: String,
+    messages: Vec<OpenAiMsg>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMsg,
+}
+
+#[derive(Deserialize)]
+struct OpenAiResp {
+    choices: Vec<OpenAiChoice>,
+}
+
+async fn call_openai_inner(
+    client: &Client,
+    message: &str,
+    config: &LlmConfig,
+    url: &str,
+) -> Result<String, String> {
+    let body = OpenAiReq {
+        model: config.model.clone(),
+        messages: vec![OpenAiMsg {
+            role: "user".into(),
+            content: message.into(),
+        }],
+    };
+    let mut req = client.post(url).json(&body);
+    if !config.api_key.is_empty() {
+        req = req.header("authorization", format!("Bearer {}", &config.api_key));
+    }
+    let res = req.send().await.map_err(|e| format!("请求失败: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("API 错误: {}", res.text().await.unwrap_or_default()));
+    }
+    let json: OpenAiResp = res.json().await.map_err(|e| e.to_string())?;
+    json.choices.into_iter().next().map(|c| c.message.content).ok_or_else(|| "空响应".into())
+}
+
+async fn call_openai(client: &Client, message: &str, config: &LlmConfig) -> Result<String, String> {
+    call_openai_inner(client, message, config, "https://api.openai.com/v1/chat/completions").await
+}
+
+async fn call_openai_compatible(client: &Client, message: &str, config: &LlmConfig) -> Result<String, String> {
+    let base = config.base_url.as_deref().unwrap_or("http://localhost:8080/v1");
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    call_openai_inner(client, message, config, &url).await
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeminiPart {
+    text: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeminiContent {
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Serialize)]
+struct GeminiReq {
+    contents: Vec<GeminiContent>,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: GeminiContent,
+}
+
+#[derive(Deserialize)]
+struct GeminiResp {
+    candidates: Vec<GeminiCandidate>,
+}
+
+async fn call_gemini(client: &Client, message: &str, config: &LlmConfig) -> Result<String, String> {
+    if config.api_key.is_empty() {
+        return Err("API Key 未设置".into());
+    }
+    let model = if config.model.is_empty() { "gemini-1.5-flash" } else { &config.model };
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, &config.api_key
+    );
+    let body = GeminiReq {
+        contents: vec![GeminiContent {
+            parts: vec![GeminiPart { text: message.into() }],
+        }],
+    };
+    let res = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("API 错误: {}", res.text().await.unwrap_or_default()));
+    }
+    let json: GeminiResp = res.json().await.map_err(|e| e.to_string())?;
+    json.candidates
+        .into_iter()
+        .next()
+        .and_then(|c| c.content.parts.into_iter().next())
+        .map(|p| p.text)
+        .ok_or_else(|| "空响应".into())
+}
+
+#[derive(Serialize)]
+struct OllamaReq {
+    model: String,
+    prompt: String,
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+struct OllamaResp {
+    response: String,
+}
+
+async fn call_ollama(client: &Client, message: &str, config: &LlmConfig) -> Result<String, String> {
+    let base = config.base_url.as_deref().unwrap_or("http://localhost:11434");
+    let url = format!("{}/api/generate", base.trim_end_matches('/'));
+    let body = OllamaReq {
+        model: config.model.clone(),
+        prompt: message.into(),
+        stream: false,
+    };
+    let res = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("请求失败: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("API 错误: {}", res.text().await.unwrap_or_default()));
+    }
+    let json: OllamaResp = res.json().await.map_err(|e| e.to_string())?;
+    Ok(json.response)
 }
 
 // ── Commands ───────────────────────────────────────────────────────
@@ -537,10 +933,11 @@ fn get_config() -> BehaviorConfig {
 fn set_config(
     config: BehaviorConfig,
     state_machine: State<StateMachine>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let old_dock = {
+    let (old_dock, old_shortcut) = {
         let sm = state_machine.lock().unwrap();
-        sm.config.show_in_dock
+        (sm.config.show_in_dock, sm.config.chat_shortcut.clone())
     };
 
     save_config(&config)?;
@@ -556,23 +953,36 @@ fn set_config(
         set_dock_visibility(config.show_in_dock);
     }
 
+    // Re-register global shortcut if changed
+    if config.chat_shortcut != old_shortcut {
+        update_chat_shortcut(&app, &config.chat_shortcut);
+    }
+
     Ok(())
 }
 
 #[tauri::command]
 fn reset_config(
     state_machine: State<StateMachine>,
+    app: tauri::AppHandle,
 ) -> Result<BehaviorConfig, String> {
     let default = BehaviorConfig::default();
     save_config(&default)?;
 
-    {
+    let old_shortcut = {
         let mut sm = state_machine.lock().unwrap();
         let old_dock = sm.config.show_in_dock;
+        let old_shortcut = sm.config.chat_shortcut.clone();
         sm.config = default.clone();
         if default.show_in_dock != old_dock {
             set_dock_visibility(default.show_in_dock);
         }
+        old_shortcut
+    };
+
+    // Re-register global shortcut if changed
+    if default.chat_shortcut != old_shortcut {
+        update_chat_shortcut(&app, &default.chat_shortcut);
     }
 
     Ok(default)
@@ -583,18 +993,76 @@ fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
     open_settings_window_impl(&app).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn open_chat_window(app: tauri::AppHandle) -> Result<(), String> {
+    open_chat_window_impl(&app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn close_chat_window(app: tauri::AppHandle) -> Result<(), String> {
+    close_chat_window_impl(&app).map_err(|e| e.to_string())
+}
+
+fn update_chat_shortcut(app: &tauri::AppHandle, shortcut_str: &str) {
+    let manager = app.global_shortcut();
+    let _ = manager.unregister_all();
+    if shortcut_str.trim().is_empty() {
+        return;
+    }
+    if let Err(e) = manager.on_shortcut(shortcut_str, move |app, _shortcut, event| {
+        if event.state == ShortcutState::Pressed {
+            let _ = open_chat_window_impl(app);
+        }
+    }) {
+        eprintln!("[Shortcut] Failed to register '{}': {}", shortcut_str, e);
+    } else {
+        println!("[Shortcut] Registered '{}'", shortcut_str);
+    }
+}
+
+#[tauri::command]
+async fn chat_send(message: String) -> Result<String, String> {
+    let config = load_or_create_llm_config();
+    let reply = send_chat_message(&message, &config).await?;
+    Ok(reply)
+}
+
+#[tauri::command]
+fn get_llm_config() -> LlmConfig {
+    load_or_create_llm_config()
+}
+
+#[tauri::command]
+fn set_llm_config(config: LlmConfig) -> Result<(), String> {
+    save_llm_config(&config)
+}
+
 // ── Entry point ────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
             let _ = window.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
 
-            // Center window initially
-            let initial_pos = if let Some(monitor) = app.primary_monitor().unwrap() {
+            // macOS: show window on all Spaces
+            set_window_all_spaces(&window);
+
+            let config = load_or_create_config();
+
+            // Initial position: fixed corner if set, otherwise center
+            let initial_pos = if let Some(ref corner) = config.fixed_corner {
+                if let Some(bounds) = get_primary_bounds(app.handle()) {
+                    let (x, y) = pick_corner_position(corner, bounds, 200, 80);
+                    let _ = window.set_position(PhysicalPosition::new(x, y));
+                    PhysicalPosition::new(x, y)
+                } else {
+                    PhysicalPosition::new(0, 0)
+                }
+            } else if let Some(monitor) = app.primary_monitor().unwrap_or(None) {
                 let size = monitor.size();
                 let pos = monitor.position();
                 let x = pos.x + (size.width as i32 - 200) / 2;
@@ -604,8 +1072,6 @@ pub fn run() {
             } else {
                 PhysicalPosition::new(0, 0)
             };
-
-            let config = load_or_create_config();
             println!("[Config] {:?}", config);
 
             // Apply initial Dock visibility
@@ -640,6 +1106,10 @@ pub fn run() {
             // Register state machine as Tauri managed state
             app.manage(state_machine.clone());
 
+            // Register global shortcut for chat
+            let shortcut_str = state_machine.lock().unwrap().config.chat_shortcut.clone();
+            update_chat_shortcut(app.handle(), &shortcut_str);
+
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -651,7 +1121,10 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet, get_config, set_config, reset_config, open_settings_window])
+        .invoke_handler(tauri::generate_handler![
+    greet, get_config, set_config, reset_config, open_settings_window,
+    open_chat_window, close_chat_window, chat_send, get_llm_config, set_llm_config
+])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
