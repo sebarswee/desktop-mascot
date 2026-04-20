@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/settings.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>桌面宠物设置</title>
+    <script type="module" src="/src/settings.ts" defer></script>
+  </head>
+  <body>
+    <div class="settings-wrapper">
+      <div class="settings-header">
+        <h3>设置</h3>
+      </div>
+
+      <div class="settings-section">
+        <h4>行为权重</h4>
+        <label>待机 <input id="idle-weight" type="number" min="0" max="100" /></label>
+        <label>走动 <input id="walk-weight" type="number" min="0" max="100" /></label>
+        <label>探头 <input id="peek-weight" type="number" min="0" max="100" /></label>
+        <label>消失 <input id="disappear-weight" type="number" min="0" max="100" /></label>
+        <label>互动 <input id="interact-weight" type="number" min="0" max="100" /></label>
+      </div>
+
+      <div class="settings-section">
+        <h4>系统</h4>
+        <label class="checkbox-label">
+          <input id="show-in-dock" type="checkbox" />
+          在 Dock 栏显示
+        </label>
+        <label class="checkbox-label">
+          <input id="show-in-menu-bar" type="checkbox" />
+          在菜单栏显示
+        </label>
+      </div>
+
+      <div class="settings-section">
+        <h4>移动方式</h4>
+        <label>固定位置
+          <select id="fixed-corner">
+            <option value="">自由漫游</option>
+            <option value="top_left">左上角</option>
+            <option value="top_right">右上角</option>
+            <option value="bottom_left">左下角</option>
+            <option value="bottom_right">右下角</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="settings-actions">
+        <button id="save-btn" class="btn-primary">保存</button>
+        <button id="reset-btn" class="btn-secondary">恢复默认</button>
+        <span id="save-status" class="save-status"></span>
+      </div>
+    </div>
+  </body>
+</html>
