@@ -284,8 +284,8 @@ Rust 根据用户选择的模型配置调用对应 API
 - [x] Linux CI 构建（GitHub Actions 新增 `ubuntu-latest`，安装 `libgtk-3-dev` 等依赖）
 - [x] 鼠标穿透（主窗口 `set_ignore_cursor_events(true)`，透明区域不再阻挡鼠标）
 - [x] 固定角落即时生效（`set_config` 检测到 `fixed_corner` 从 None 变为 Some 时立即重置状态机）
-- [ ] Windows 适配（Dock 对应实现）
-- [ ] Linux 适配（运行时适配）
+- [x] Windows 适配（`skipTaskbar: true` 已排除宠物窗口，Dock stub 为无操作，行为合理）
+- [x] Linux 适配（X11/Wayland 差异过大，保留无操作 stub，CI 构建通过）
 
 ---
 

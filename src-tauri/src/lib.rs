@@ -247,6 +247,7 @@ fn set_dock_visibility(show: bool) {
     }
 }
 
+// Windows / Linux: no Dock concept; window already hidden from taskbar via `skip_taskbar: true`
 #[cfg(not(target_os = "macos"))]
 fn set_dock_visibility(_show: bool) {}
 
@@ -263,6 +264,7 @@ fn set_window_all_spaces(window: &tauri::WebviewWindow) {
     }
 }
 
+// Windows / Linux: window manager differences are too large to unify; rely on OS defaults
 #[cfg(not(target_os = "macos"))]
 fn set_window_all_spaces(_window: &tauri::WebviewWindow) {}
 
