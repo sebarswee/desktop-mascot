@@ -329,3 +329,400 @@ desktop-mascot/
 6. **全局快捷键跨平台差异**：macOS 默认 `Cmd+Shift+C`，Windows/Linux 默认 `Ctrl+Alt+C`，通过 `#[cfg(target_os = "macos")]` 在编译期确定默认值
 7. **无响应根因与修复**：`std::sync::Mutex` 锁竞争导致 UI 线程阻塞。根本解法是命令函数彻底不拿锁，仅做窗口操作；状态同步完全委托给 `tick()` 循环根据窗口可见性自动推断
 8. **快捷键录制 UX**：设置面板中快捷键输入框采用 `focus → keydown 监听 → 自动格式化` 的交互模式，支持 `Escape` 取消、`Backspace` 清空，避免用户手动输入格式错误
+9. **API Key 安全存储**：`#[serde(skip_serializing)]` + `keyring` 组合方案——反序列化正常读取前端传入值，序列化时跳过避免明文落盘
+
+---
+
+## 11. Sprint 5~7：从「工具」到「Agent」——端侧模型 + 自主行为
+
+### 11.1 愿景：Open Claw 式的自动化智能助手
+
+当前宠物是**被动响应型**（用户点击 → 打开对话）。下一阶段目标是**主动智能型**：
+
+- 用户未操作时，宠物能基于端侧大模型自主决策、主动发起交互
+- 所有推理在本地完成，零 API 成本、零隐私泄露
+- 状态栏成为用户与 Agent 之间的「轻量通信层」
+
+### 11.2 总体架构演进
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  表现层（Web Frontend）                                      │
+│  · Lottie 动画渲染引擎                                       │
+│  · 状态栏（Status Bar）：Thinking / NewMessage / Downloading │
+│  · 对话窗口（chat.html）                                     │
+├─────────────────────────────────────────────────────────────┤
+│  控制层（Tauri Core / Rust）                                 │
+│  · 窗口管理                                                  │
+│  · 行为状态机调度器（100ms tick，新增 Autonomous 触发）      │
+│  · LLM 路由层（云端 API ↔ 端侧模型自动切换）                 │
+│  · 自主行为引擎（时间窗口 + 定时器 + 本地推理）              │
+├─────────────────────────────────────────────────────────────┤
+│  推理层（本地 / 外部）                                       │
+│  · 端侧模型：llama.cpp（GGUF）Rust 绑定                      │
+│  · 云端 API：Claude / OpenAI / Gemini / Ollama（已有）       │
+│  · 模型下载器（HTTP 断点续传 + 进度事件）                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 11.3 端侧大模型子系统
+
+#### 11.3.1 技术选型
+
+| 维度 | 候选方案 | 评估 | 结论 |
+| :--- | :--- | :--- | :--- |
+| 推理引擎 | `llama-cpp-2`（llama.cpp Rust 绑定） | GGUF 事实标准，量化支持完善，CPU/GPU 均可推理 | **采用** |
+| 推理引擎 | `candle-core`（HuggingFace 纯 Rust） | 无 C++ 依赖，但 GGUF 支持不成熟 | 暂不采用 |
+| 推理引擎 | 外部 Ollama 服务 | 需用户额外安装，非「内置」 | 备用方案 |
+| 模型格式 | GGUF（llama.cpp 格式） | 生态最成熟，量化方案丰富 | **采用** |
+
+#### 11.3.2 模型配置
+
+```json
+{
+  "local_model": {
+    "enabled": true,
+    "model_id": "gemma-4-e4b",
+    "gguf_url": "https://huggingface.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive/resolve/main/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf",
+    "gguf_filename": "gemma-4-e4b-iq4_xs.gguf",
+    "ctx_size": 4096,
+    "gpu_layers": 0,
+    "max_tokens": 256,
+    "temperature": 0.8
+  }
+}
+```
+
+- **模型路径**：`dirs::data_dir()` + `desktop-mascot/models/gemma-4-e4b-iq4_xs.gguf`
+- **IQ4_XS 量化**：约 2GB，4B 参数模型在消费级 CPU 上可实时推理
+
+#### 11.3.3 模型下载流程
+
+```
+首次启动
+  ↓
+检测 models/ 目录下是否存在 GGUF 文件
+  ↓
+不存在 → 弹出「首次使用」提示窗（前端独立页面）
+  ↓
+用户点击「下载模型」
+  ↓
+Rust 启动 reqwest 下载线程
+  ↓
+每 500ms 推送进度事件（mascot:model_download）
+  ↓
+状态栏显示下载进度（如 ████████░░ 80%）
+  ↓
+下载完成 → 状态栏显示「模型就绪 ✓」
+  ↓
+自动加载模型到内存（llama.cpp ctx 初始化）
+```
+
+#### 11.3.4 LLM 路由层（自动切换）
+
+```rust
+enum LlmBackend {
+    Cloud(LlmProvider),   // 现有云端 API
+    Local(LocalModel),    // 端侧模型
+}
+
+fn pick_backend(config: &BehaviorConfig) -> LlmBackend {
+    if config.llm.provider == LlmProvider::Local {
+        return LlmBackend::Local(...);
+    }
+    // 用户显式配置了云端 provider + api_key
+    if !config.llm.api_key.is_empty() {
+        return LlmBackend::Cloud(config.llm.provider.clone());
+    }
+    // 无 API Key，但本地模型可用 → 降级到本地
+    if local_model_ready() {
+        return LlmBackend::Local(...);
+    }
+    // 都无法使用
+    Err("无可用模型".into())
+}
+```
+
+### 11.3.5 Agent 设定记忆（System Prompt 注入层）
+
+#### 11.3.5.1 设计目标
+
+解决「Agent 失忆」问题：无论调用本地模型还是云端模型，每次推理前都必须注入用户设定的 Agent 人格，确保对话一致性。
+
+#### 11.3.5.2 配置结构
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentProfile {
+    #[serde(default = "default_agent_name")]
+    name: String,
+    #[serde(default)]
+    personality: String,       // 性格描述（如：活泼、傲娇、温柔）
+    #[serde(default)]
+    background: String,        // 背景故事
+    #[serde(default)]
+    speaking_style: String,    // 说话风格（如：带emoji、简短、毒舌）
+    #[serde(default)]
+    preferences: String,       // 用户喜好记忆（如：喜欢咖啡、讨厌香菜）
+}
+
+fn default_agent_name() -> String { "小喵".to_string() }
+
+impl Default for AgentProfile {
+    fn default() -> Self {
+        Self {
+            name: default_agent_name(),
+            personality: "活泼开朗，有点傲娇，喜欢调侃用户".to_string(),
+            background: "一只来自数字世界的桌面宠物，陪用户一起工作学习".to_string(),
+            speaking_style: "口语化、简短、偶尔带emoji".to_string(),
+            preferences: String::new(),
+        }
+    }
+}
+```
+
+#### 11.3.5.3 System Prompt 组装器
+
+```rust
+fn build_system_prompt(profile: &AgentProfile, context: &Context) -> String {
+    format!(
+        r#"你是 {}，一个桌面宠物 AI 助手。
+
+【性格】
+{}
+
+【背景】
+{}
+
+【说话风格】
+{}
+
+【关于用户的记忆】
+{}
+
+【当前上下文】
+时间：{}
+用户已连续工作 {} 分钟。
+
+要求：
+- 始终记住你是谁，不要说自己是大模型或 AI 助手
+- 保持人设一致性，不要突然切换语气
+- 回复简短（50字以内），除非用户明确要求详细回答
+"#,
+        profile.name,
+        profile.personality,
+        profile.background,
+        profile.speaking_style,
+        if profile.preferences.is_empty() { "暂无" } else { &profile.preferences },
+        context.current_time,
+        context.work_duration_minutes,
+    )
+}
+```
+
+#### 11.3.5.4 注入位置
+
+| 调用路径 | 注入时机 |
+| :--- | :--- |
+| 用户主动对话（`chat_send`） | 组装消息数组时，第一条消息 role="system" |
+| 自主行为推理 | 构造 System Prompt + 触发器场景提示 |
+| 本地模型（llama.cpp） | `llama.cpp` 的 `system` 字段 |
+| 云端模型（Claude/OpenAI 等） | Messages API 的 `"role": "system"` |
+
+#### 11.3.5.5 记忆更新机制
+
+- **用户显式更新**：设置面板「Agent 设定」页修改后保存
+- **AI 自动提取**：对话中 Agent 可标记 `#memory: 用户喜欢喝美式咖啡`，Rust 层解析后更新 `profile.preferences`
+- **版本控制**：每次更新写入 `behavior.json`，下次启动自动加载
+
+### 11.4 助手交互状态栏
+
+#### 11.4.1 状态定义
+
+| 状态 | 图标 | 触发条件 | 用户交互 |
+| :--- | :--- | :--- | :--- |
+| `Idle` | 空 / 小圆点 | 无活跃任务 | 点击打开对话 |
+| `Thinking` | `...` 动画 | AI 正在推理（本地或云端） | 可点击关闭对话，推理继续后台进行 |
+| `NewMessage` | `✉️` | AI 回复完成，对话窗口未打开 | 点击打开对话并阅读 |
+| `Downloading` | 进度条 | 模型文件下载中 | 不可点击，纯展示 |
+| `Error` | `⚠️` | 模型加载失败 / 下载失败 | 点击打开设置 |
+
+#### 11.4.2 前端实现
+
+在主窗口 `index.html` 的 mascot 容器上方叠加一个绝对定位的状态栏元素：
+
+```html
+<div id="status-bar" class="status-bar hidden">
+  <span id="status-icon"></span>
+  <span id="status-text"></span>
+  <div id="status-progress" class="progress-bar hidden"></div>
+</div>
+```
+
+```css
+.status-bar {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 4px 10px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(8px);
+  color: #fff;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  pointer-events: auto;  /* 状态栏可点击，与主窗口穿透不冲突 */
+  cursor: pointer;
+  transition: opacity 0.3s;
+}
+```
+
+#### 11.4.3 Rust → 前端事件
+
+```rust
+// 状态栏更新
+app.emit("mascot:status", json!({
+    "state": "thinking",  // idle | thinking | new_message | downloading | error
+    "progress": null,     // 0~100，仅 downloading 状态
+    "text": "...",        // 可选提示文字
+}));
+```
+
+### 11.5 自主行为引擎
+
+#### 11.5.1 行为触发器（Trigger）
+
+| 触发器 | 条件 | 频率 | 示例 |
+| :--- | :--- | :--- | :--- |
+| `TimeOfDay` | 系统时间匹配 | 每天一次 | 早上 9:00 问候 |
+| `IdleDuration` | 用户无操作时长 | 每小时最多一次 | 久坐 1 小时提醒喝水 |
+| `Random` | 随机概率 | 每 15min 评估一次 | 随机唠嗑、讲笑话 |
+| `Scheduled` | 用户设定的具体时间 | 一次性/重复 | 下午 3 点开会提醒 |
+
+#### 11.5.2 自主行为执行流程
+
+```
+行为状态机 tick（每 100ms）
+  ↓
+每 60 秒（或 15 分钟）评估一次触发器
+  ↓
+触发器命中？
+  ├─ 否 → 继续 tick
+  └─ 是 → 进入 Autonomous 模式
+         ↓
+    推送状态栏：Thinking (...)
+         ↓
+    构造 System Prompt（注入时间、上下文、触发器类型）
+         ↓
+    调用本地模型生成回复
+         ↓
+    回复完成
+         ↓
+    对话窗口是否打开？
+      ├─ 是 → 直接推送消息到对话
+      └─ 否 → 状态栏显示 NewMessage (✉️)
+         ↓
+    返回 Idle
+```
+
+#### 11.5.3 System Prompt 模板（自主行为）
+
+```
+你是一个桌面宠物的 AI 人格。当前时间：{time}，用户已连续工作 {duration} 分钟。
+触发场景：{trigger_name}（morning_greeting / health_reminder / random_chat / scheduled_task）
+
+请生成一段简短、亲切、略带俏皮的回复（不超过 50 字）：
+- 如果是早上问候：祝用户今天愉快，可提一句天气（如果有天气数据）
+- 如果是健康提醒：提醒用户喝水/活动，不要太生硬
+- 如果是随机唠嗑：讲个段子、分享冷知识、吐槽一下
+- 如果是定时任务：直接提醒用户该做什么
+
+回复风格：活泼、像朋友一样，偶尔带emoji。
+```
+
+#### 11.5.4 久坐检测
+
+```rust
+// 通过监听全局输入事件实现（macOS: NSEventMonitor, Windows: SetWinEventHook, Linux: XRecord）
+// 简化版：以最后一次对话/交互时间为准
+struct UserActivity {
+    last_interaction: Instant,  // 最后一次点击宠物、发送消息、打开设置
+}
+
+fn check_sedentary(activity: &UserActivity) -> bool {
+    activity.last_interaction.elapsed() > Duration::from_secs(3600)
+}
+```
+
+实际实现中，前端每次 `click` / `keydown` 推送 `user:activity` 事件更新 `last_interaction`。
+
+### 11.6 新增配置项
+
+```json
+{
+  "local_model": {
+    "enabled": true,
+    "auto_download": true,
+    "gguf_url": "...",
+    "ctx_size": 4096,
+    "gpu_layers": 0,
+    "max_tokens": 256,
+    "temperature": 0.8
+  },
+  "autonomous": {
+    "enabled": true,
+    "morning_greeting": true,
+    "morning_time": "09:00",
+    "health_reminder": true,
+    "health_interval_minutes": 60,
+    "random_chat": true,
+    "random_chat_interval_minutes": 30,
+    "random_chat_probability": 0.3
+  },
+  "agent_profile": {
+    "name": "小喵",
+    "personality": "活泼开朗，有点傲娇，喜欢调侃用户",
+    "background": "一只来自数字世界的桌面宠物，陪用户一起工作学习",
+    "speaking_style": "口语化、简短、偶尔带emoji",
+    "preferences": ""
+  }
+}
+```
+
+---
+
+## 12. 开发路线图（Sprint 5~7）
+
+### Sprint 5：端侧模型 + 状态栏（核心基建）
+
+- [ ] 引入 `llama-cpp-2` 依赖，编写 GGUF 模型加载封装
+- [ ] 模型下载器：reqwest HTTP 下载 + 断点续传 + 进度事件推送
+- [ ] 首次启动流程：检测模型 → 提示下载 → 进度条 → 加载完成
+- [ ] 状态栏 UI：主窗口顶部叠加，支持 Thinking / NewMessage / Downloading / Error
+- [ ] LLM 路由层：无 API Key 时自动降级到本地模型
+- [ ] 设置面板新增「本地模型」页：模型开关、下载/重新下载、参数调节
+- [ ] 设置面板新增「Agent 设定」页：名字、性格、背景、说话风格、喜好记忆
+- [ ] 设置面板新增「自主行为」页：开关、时间、频率配置
+- [ ] System Prompt 组装器：将 Agent 设定注入到所有 LLM 调用（本地 + 云端）
+
+### Sprint 6：自主行为引擎（Agent 核心）
+
+- [ ] 自主行为触发器框架（TimeOfDay / IdleDuration / Random / Scheduled）
+- [ ] 早上问候：时间匹配 + 本地模型生成问候语
+- [ ] 久坐提醒：基于用户交互时间的健康提醒
+- [ ] 随机唠嗑：随机触发 + 本地模型生成趣味内容
+- [ ] 定时任务：用户可设定一次性或重复提醒
+- [ ] 状态栏联动：Thinking 时显示「...」，完成后对话未打开则显示「✉️」
+- [ ] 用户活动追踪：前端点击/输入事件更新 `last_interaction`
+
+### Sprint 7：记忆深化与进阶交互
+
+- [ ] 对话短期记忆：最近 N 轮对话摘要，注入模型上下文窗口
+- [ ] 记忆自动提取：Agent 在对话中标记 `#memory:`，Rust 层解析并更新 `profile.preferences`
+- [ ] 天气接入：调用天气 API，注入到问候语和自主行为提示词
+- [ ] 语音合成（TTS）：本地模型回复后可选语音播报
+- [ ] 工具调用框架：让模型能调用系统 API（打开应用、查询日历等）
+- [ ] 情绪系统：根据用户回复 tone 调整宠物行为活跃度
