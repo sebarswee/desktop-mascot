@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, PhysicalPosition, State};
+use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 // ── State definitions ──────────────────────────────────────────────
@@ -57,11 +59,14 @@ impl Default for LlmProvider {
     }
 }
 
+const KEYRING_SERVICE: &str = "desktop-mascot";
+const KEYRING_USERNAME: &str = "llm_api_key";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LlmConfig {
     #[serde(default)]
     provider: LlmProvider,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     api_key: String,
     #[serde(default = "default_model")]
     model: String,
@@ -105,6 +110,8 @@ struct BehaviorConfig {
     auto_close_chat: bool,
     #[serde(default = "default_chat_shortcut")]
     chat_shortcut: String,
+    #[serde(default)]
+    auto_start: bool,
 }
 
 fn default_true() -> bool {
@@ -135,14 +142,27 @@ impl Default for BehaviorConfig {
             llm: LlmConfig::default(),
             auto_close_chat: true,
             chat_shortcut: default_chat_shortcut(),
+            auto_start: false,
         }
     }
 }
 
+fn config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("desktop-mascot")
+}
+
 fn config_path() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("behavior.json")
+    config_dir().join("behavior.json")
+}
+
+fn ensure_config_dir() -> Result<(), String> {
+    let dir = config_dir();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn load_or_create_config() -> BehaviorConfig {
@@ -158,28 +178,57 @@ fn load_or_create_config() -> BehaviorConfig {
     }
 
     let default = BehaviorConfig::default();
-    if let Ok(json) = serde_json::to_string_pretty(&default) {
-        let _ = std::fs::write(&path, json);
-        println!("[Config] Created default at {:?}", path);
+    if ensure_config_dir().is_ok() {
+        if let Ok(json) = serde_json::to_string_pretty(&default) {
+            let _ = std::fs::write(&path, json);
+            println!("[Config] Created default at {:?}", path);
+        }
     }
     default
 }
 
 fn save_config(config: &BehaviorConfig) -> Result<(), String> {
+    ensure_config_dir()?;
     let path = config_path();
     let json = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
     Ok(())
 }
 
+fn get_api_key_from_keyring() -> String {
+    match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USERNAME) {
+        Ok(entry) => match entry.get_password() {
+            Ok(key) => key,
+            Err(_) => String::new(),
+        },
+        Err(_) => String::new(),
+    }
+}
+
+fn set_api_key_in_keyring(api_key: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
+        .map_err(|e| format!("Keyring init failed: {}", e))?;
+    if api_key.is_empty() {
+        let _ = entry.delete_credential();
+        Ok(())
+    } else {
+        entry.set_password(api_key)
+            .map_err(|e| format!("Keyring save failed: {}", e))
+    }
+}
+
 fn load_or_create_llm_config() -> LlmConfig {
-    load_or_create_config().llm
+    let mut config = load_or_create_config().llm;
+    config.api_key = get_api_key_from_keyring();
+    config
 }
 
 fn save_llm_config(config: &LlmConfig) -> Result<(), String> {
     let mut behavior = load_or_create_config();
+    let api_key = config.api_key.clone();
     behavior.llm = config.clone();
-    save_config(&behavior)
+    save_config(&behavior)?;
+    set_api_key_in_keyring(&api_key)
 }
 
 // ── macOS Window helpers ───────────────────────────────────────────
@@ -261,7 +310,7 @@ fn open_chat_window_impl(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
             tauri::WebviewUrl::App("chat.html".into()),
         )
         .title("与宠物对话")
-        .inner_size(500.0, 600.0)
+        .inner_size(580.0, 720.0)
         .center()
         .resizable(false)
         .decorations(false)
@@ -440,6 +489,50 @@ struct StateMachineInner {
 
 type StateMachine = Arc<Mutex<StateMachineInner>>;
 
+// ── Chat History ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+    timestamp: u64,
+}
+
+#[derive(Clone)]
+struct ChatHistory(Arc<Mutex<Vec<ChatMessage>>>);
+
+impl ChatHistory {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn push(&self, role: &str, content: String) {
+        let msg = ChatMessage {
+            role: role.to_string(),
+            content,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        let mut hist = self.0.lock().unwrap();
+        hist.push(msg);
+        // Keep last 100 messages to prevent unbounded growth
+        if hist.len() > 100 {
+            let excess = hist.len() - 100;
+            hist.drain(0..excess);
+        }
+    }
+
+    fn get_all(&self) -> Vec<ChatMessage> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+}
+
 fn transition_to(
     sm: &mut StateMachineInner,
     new_state: MascotState,
@@ -524,6 +617,7 @@ fn pick_next_state(sm: &StateMachineInner) -> MascotState {
 
     // Fixed corner mode: never walk or peek; stay put with idle / interact / disappear
     let (walk_w, peek_w) = if sm.config.fixed_corner.is_some() {
+        println!("[pick_next_state] fixed_corner={:?}, disabling walk/peek", sm.config.fixed_corner);
         (0, 0)
     } else {
         (sm.config.walk_weight, sm.config.peek_weight)
@@ -935,17 +1029,44 @@ fn set_config(
     state_machine: State<StateMachine>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let (old_dock, old_shortcut) = {
+    println!("[set_config] called");
+    let (old_dock, old_shortcut, old_auto_start) = {
         let sm = state_machine.lock().unwrap();
-        (sm.config.show_in_dock, sm.config.chat_shortcut.clone())
+        (sm.config.show_in_dock, sm.config.chat_shortcut.clone(), sm.config.auto_start)
     };
 
-    save_config(&config)?;
+    // Save API key to keyring
+    if let Err(e) = set_api_key_in_keyring(&config.llm.api_key) {
+        println!("[set_config] api_key save failed: {}", e);
+        return Err(format!("API Key 保存失败: {}", e));
+    }
+    println!("[set_config] api_key saved to keyring");
+
+    if let Err(e) = save_config(&config) {
+        println!("[set_config] save_config failed: {}", e);
+        return Err(e);
+    }
+    println!("[set_config] save_config ok");
 
     // Update running state machine
     {
         let mut sm = state_machine.lock().unwrap();
+        let old_fixed = sm.config.fixed_corner.clone();
         sm.config = config.clone();
+
+        // If fixed corner is newly set, immediately reset to Idle and move to corner
+        if old_fixed.is_none() && config.fixed_corner.is_some() {
+            if let Some(bounds) = get_primary_bounds(&app) {
+                if let Some(ref corner) = config.fixed_corner {
+                    let (tx, ty) = pick_corner_position(corner, bounds, 200, 80);
+                    sm.target_x = tx;
+                    sm.target_y = ty;
+                    sm.state = MascotState::Idle;
+                    sm.idle_ticks = 0;
+                    println!("[set_config] Fixed corner activated, reset to ({}, {})", tx, ty);
+                }
+            }
+        }
     }
 
     // Apply Dock visibility only when value changes (macOS only)
@@ -956,6 +1077,21 @@ fn set_config(
     // Re-register global shortcut if changed
     if config.chat_shortcut != old_shortcut {
         update_chat_shortcut(&app, &config.chat_shortcut);
+    }
+
+    // Apply auto-start if changed
+    if config.auto_start != old_auto_start {
+        let autostart_manager = app.autolaunch();
+        if config.auto_start {
+            if let Err(e) = autostart_manager.enable() {
+                eprintln!("[Autostart] Failed to enable: {}", e);
+            } else {
+                println!("[Autostart] Enabled");
+            }
+        } else {
+            let _ = autostart_manager.disable();
+            println!("[Autostart] Disabled");
+        }
     }
 
     Ok(())
@@ -1021,10 +1157,32 @@ fn update_chat_shortcut(app: &tauri::AppHandle, shortcut_str: &str) {
 }
 
 #[tauri::command]
-async fn chat_send(message: String) -> Result<String, String> {
+async fn chat_send(
+    message: String,
+    history: State<'_, ChatHistory>,
+) -> Result<String, String> {
+    history.push("user", message.clone());
     let config = load_or_create_llm_config();
-    let reply = send_chat_message(&message, &config).await?;
-    Ok(reply)
+    match send_chat_message(&message, &config).await {
+        Ok(reply) => {
+            history.push("ai", reply.clone());
+            Ok(reply)
+        }
+        Err(e) => {
+            history.push("error", e.clone());
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command]
+fn get_chat_history(history: State<'_, ChatHistory>) -> Vec<ChatMessage> {
+    history.get_all()
+}
+
+#[tauri::command]
+fn clear_chat_history(history: State<'_, ChatHistory>) {
+    history.clear();
 }
 
 #[tauri::command]
@@ -1037,6 +1195,24 @@ fn set_llm_config(config: LlmConfig) -> Result<(), String> {
     save_llm_config(&config)
 }
 
+#[derive(Deserialize)]
+struct SetApiKeyPayload {
+    api_key: String,
+}
+
+#[tauri::command]
+fn get_api_key() -> String {
+    get_api_key_from_keyring()
+}
+
+#[tauri::command]
+fn set_api_key(payload: SetApiKeyPayload) -> Result<(), String> {
+    println!("[set_api_key] called, key length: {}", payload.api_key.len());
+    let result = set_api_key_in_keyring(&payload.api_key);
+    println!("[set_api_key] result: {:?}", result);
+    result
+}
+
 // ── Entry point ────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1044,9 +1220,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
             let _ = window.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
+
+            // Ignore mouse events on transparent areas of the mascot window
+            let _ = window.set_ignore_cursor_events(true);
 
             // macOS: show window on all Spaces
             set_window_all_spaces(&window);
@@ -1077,6 +1257,18 @@ pub fn run() {
             // Apply initial Dock visibility
             set_dock_visibility(config.show_in_dock);
 
+            // Apply auto-start setting
+            let autostart_manager = app.autolaunch();
+            if config.auto_start {
+                if let Err(e) = autostart_manager.enable() {
+                    eprintln!("[Autostart] Failed to enable: {}", e);
+                } else {
+                    println!("[Autostart] Enabled");
+                }
+            } else {
+                let _ = autostart_manager.disable();
+            }
+
             // Create menu bar tray if enabled
             if config.show_in_menu_bar {
                 if let Err(e) = create_tray(app.handle()) {
@@ -1106,6 +1298,9 @@ pub fn run() {
             // Register state machine as Tauri managed state
             app.manage(state_machine.clone());
 
+            // Register chat history
+            app.manage(ChatHistory::new());
+
             // Register global shortcut for chat
             let shortcut_str = state_machine.lock().unwrap().config.chat_shortcut.clone();
             update_chat_shortcut(app.handle(), &shortcut_str);
@@ -1123,8 +1318,73 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
     greet, get_config, set_config, reset_config, open_settings_window,
-    open_chat_window, close_chat_window, chat_send, get_llm_config, set_llm_config
+    open_chat_window, close_chat_window, chat_send, get_chat_history, clear_chat_history,
+    get_llm_config, set_llm_config, get_api_key, set_api_key
 ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_roundtrip() {
+        let config = BehaviorConfig::default();
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        println!("Serialized:\n{}", json);
+        let deserialized: BehaviorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.llm.api_key, "");
+    }
+
+    #[test]
+    fn test_config_deserialize_with_api_key() {
+        let json = r#"{
+            "idle_weight": 70,
+            "walk_weight": 15,
+            "peek_weight": 8,
+            "disappear_weight": 5,
+            "interact_weight": 2,
+            "show_in_dock": false,
+            "show_in_menu_bar": true,
+            "fixed_corner": null,
+            "llm": {
+                "provider": "claude",
+                "api_key": "secret123",
+                "model": "claude-3-5-sonnet",
+                "base_url": null
+            },
+            "auto_close_chat": true,
+            "chat_shortcut": "Cmd+Shift+C",
+            "auto_start": false
+        }"#;
+        let config: BehaviorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.llm.api_key, "secret123"); // skip_serializing reads on deser
+        assert_eq!(config.llm.model, "claude-3-5-sonnet");
+        assert!(!config.auto_start);
+    }
+
+    #[test]
+    fn test_keyring_roundtrip() {
+        let test_key = "test_api_key_12345";
+        set_api_key_in_keyring(test_key).expect("save to keyring failed");
+        let retrieved = get_api_key_from_keyring();
+        assert_eq!(retrieved, test_key);
+        // cleanup
+        let _ = set_api_key_in_keyring("");
+    }
+
+    #[test]
+    fn test_save_and_load_config() {
+        let mut config = BehaviorConfig::default();
+        config.auto_start = true;
+        config.llm.model = "test-model".to_string();
+        save_config(&config).expect("save_config failed");
+        let loaded = load_or_create_config();
+        assert_eq!(loaded.auto_start, true);
+        assert_eq!(loaded.llm.model, "test-model");
+        // cleanup
+        let _ = std::fs::remove_file(config_path());
+    }
 }

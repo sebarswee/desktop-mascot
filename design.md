@@ -276,13 +276,16 @@ Rust 根据用户选择的模型配置调用对应 API
 - [x] Claude 第三方代理支持（配置 Base URL，自动降级为 OpenAI-compatible 格式调用）
 - [x] 编译器 warning 清零（`#[allow(unexpected_cfgs)]` + 未使用变量前缀 `_`）
 
-### Sprint 4： polish + 跨平台 🔄
+### Sprint 4： polish + 跨平台 ✅
 
-- [ ] Windows 适配（Dock/Tray 对应实现）
-- [ ] Linux 适配
-- [ ] 鼠标穿透优化
-- [ ] 开机自启
-- [ ] 设置项加密存储（API Key）
+- [x] 配置文件路径标准化（`dirs::config_dir()`，跨平台存储）
+- [x] 设置项加密存储（API Key 通过 `keyring` 写入 OS 密钥链，`#[serde(skip_serializing)]` 避免明文落盘）
+- [x] 开机自启（`tauri-plugin-autostart`，设置面板增加「开机自启」开关）
+- [x] Linux CI 构建（GitHub Actions 新增 `ubuntu-latest`，安装 `libgtk-3-dev` 等依赖）
+- [x] 鼠标穿透（主窗口 `set_ignore_cursor_events(true)`，透明区域不再阻挡鼠标）
+- [x] 固定角落即时生效（`set_config` 检测到 `fixed_corner` 从 None 变为 Some 时立即重置状态机）
+- [ ] Windows 适配（Dock 对应实现）
+- [ ] Linux 适配（运行时适配）
 
 ---
 

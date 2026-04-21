@@ -5,6 +5,7 @@
   "windows": ["main", "settings", "chat"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "opener:default",
+    "autostart:default"
   ]
 }

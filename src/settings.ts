@@ -18,6 +18,7 @@ interface BehaviorConfig {
   fixed_corner: string | null;
   auto_close_chat: boolean;
   chat_shortcut: string;
+  auto_start: boolean;
   llm: LlmConfig;
 }
 
@@ -53,6 +54,7 @@ function getFormValues(): BehaviorConfig {
     fixed_corner: getSelect('fixed-corner'),
     auto_close_chat: getBool('auto-close-chat'),
     chat_shortcut: getStr('chat-shortcut'),
+    auto_start: getBool('auto-start'),
     llm: {
       provider: getStr('llm-provider') || 'claude',
       api_key: getStr('llm-api-key'),
@@ -62,19 +64,19 @@ function getFormValues(): BehaviorConfig {
   };
 }
 
-function setFormValues(config: BehaviorConfig) {
-  const setVal = (id: string, val: string | number | boolean | null) => {
-    const el = document.getElementById(id) as HTMLInputElement | HTMLSelectElement;
-    if (!el) return;
-    if (el.type === 'checkbox') {
-      (el as HTMLInputElement).checked = val as boolean;
-    } else if (el.tagName === 'SELECT') {
-      (el as HTMLSelectElement).value = val === null ? '' : String(val);
-    } else {
-      (el as HTMLInputElement).value = String(val ?? '');
-    }
-  };
+function setVal(id: string, val: string | number | boolean | null) {
+  const el = document.getElementById(id) as HTMLInputElement | HTMLSelectElement;
+  if (!el) return;
+  if (el.type === 'checkbox') {
+    (el as HTMLInputElement).checked = val as boolean;
+  } else if (el.tagName === 'SELECT') {
+    (el as HTMLSelectElement).value = val === null ? '' : String(val);
+  } else {
+    (el as HTMLInputElement).value = String(val ?? '');
+  }
+}
 
+function setFormValues(config: BehaviorConfig) {
   setVal('idle-weight', config.idle_weight);
   setVal('walk-weight', config.walk_weight);
   setVal('peek-weight', config.peek_weight);
@@ -85,6 +87,7 @@ function setFormValues(config: BehaviorConfig) {
   setVal('fixed-corner', config.fixed_corner);
   setVal('auto-close-chat', config.auto_close_chat);
   setVal('chat-shortcut', config.chat_shortcut);
+  setVal('auto-start', config.auto_start);
 
   setVal('llm-provider', config.llm.provider);
   setVal('llm-api-key', config.llm.api_key);
@@ -115,7 +118,10 @@ async function loadSettings() {
   try {
     currentConfig = await invoke<BehaviorConfig>('get_config');
     setFormValues(currentConfig);
-    console.log('[Settings] Loaded:', currentConfig);
+    // Load API key separately from keyring
+    const apiKey = await invoke<string>('get_api_key');
+    setVal('llm-api-key', apiKey);
+    console.log('[Settings] Loaded');
   } catch (e) {
     console.error('[Settings] Load failed:', e);
   }
@@ -127,8 +133,8 @@ async function saveSettings() {
     await invoke('set_config', { config });
     currentConfig = config;
     showSaveStatus('已保存', true);
-    console.log('[Settings] Saved:', config);
-  } catch (e) {
+    console.log('[Settings] Saved');
+  } catch (e: any) {
     showSaveStatus('保存失败', false);
     console.error('[Settings] Save failed:', e);
   }
